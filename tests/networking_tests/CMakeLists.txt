@@ -19,6 +19,7 @@ endfunction()
 # HTTP Examples
 add_subdirectory(http_examples)
 add_subdirectory(http_server_post_test)
+add_subdirectory(http_body_stream_test)
 add_subdirectory(http_server_test)
 add_subdirectory(http_smuggling_test)
 add_subdirectory(http_header_strictness_test)

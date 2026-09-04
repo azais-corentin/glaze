@@ -1363,6 +1363,15 @@ namespace glz
    using request_hook = std::function<void(const request&, response&)>;
    using response_hook = std::function<void(const request&, const response&)>;
 
+   // Read granularity for streaming request bodies: the server hands the sink at most
+   // this many bytes at a time and reuses one buffer of this size per connection.
+   inline constexpr std::size_t body_chunk_size = 64 * 1024;
+
+   // When a body route is rejected before its body has been read, the peer is still
+   // uploading. The server drains and discards at most this many bytes so the client can
+   // finish its send and read the error response instead of hitting a connection reset.
+   inline constexpr std::size_t body_linger_discard_limit = 8 * 1024 * 1024;
+
    /**
     * @brief Configuration for HTTP connection behavior
     *
@@ -1409,6 +1418,18 @@ namespace glz
        * Default: 100 MB
        */
       size_t max_request_body_size = http_default_max_body_size;
+
+      /**
+       * @brief Maximum allowed request body size in bytes for streaming (body-sink) routes
+       *
+       * Streaming body routes never hold the body in memory, so their limit is
+       * independent of max_request_body_size and buffered routes can stay small.
+       * Requests whose Content-Length exceeds this limit are rejected with HTTP 413
+       * before the sink is created or any body byte is read.
+       * Set to 0 for no limit.
+       * Default: 0 (no limit)
+       */
+      size_t max_streamed_body_size = 0;
    };
 
    // Server implementation using non-blocking asio with WebSocket support
@@ -1783,6 +1804,14 @@ namespace glz
             }
          }
 
+         // Mount streaming request-body routes
+         for (const auto& [path, method_handlers] : router.body_routes.routes) {
+            const auto full_path = join(path);
+            for (const auto& [method, entry] : method_handlers) {
+               root_router.body(method, full_path, entry.handle, entry.spec);
+            }
+         }
+
          // Mount WebSocket routes. Entries are keyed by http_method::GET (the
          // upgrade method), so look that slot up directly rather than iterating.
          for (const auto& [path, method_handlers] : router.websocket_routes.routes) {
@@ -1942,6 +1971,26 @@ namespace glz
       inline http_server& stream_post(std::string_view path, streaming_handler handle, const route_spec& spec = {})
       {
          return stream(http_method::POST, path, std::move(handle), spec);
+      }
+
+      // Register a streaming request-body route. The handler runs once the request head
+      // has been parsed and returns the sink that consumes the body in chunks.
+      inline http_server& body(http_method method, std::string_view path, body_handler handle,
+                               const route_spec& spec = {})
+      {
+         root_router.body(method, path, std::move(handle), spec);
+         return *this;
+      }
+
+      // Convenience methods for streaming request bodies
+      inline http_server& body_post(std::string_view path, body_handler handle, const route_spec& spec = {})
+      {
+         return body(http_method::POST, path, std::move(handle), spec);
+      }
+
+      inline http_server& body_put(std::string_view path, body_handler handle, const route_spec& spec = {})
+      {
+         return body(http_method::PUT, path, std::move(handle), spec);
       }
 
       inline http_server& on_error(error_handler handle)
@@ -2300,6 +2349,17 @@ namespace glz
 
       size_t max_request_body_size() const { return conn_config_.max_request_body_size; }
 
+      // Set maximum request body size in bytes for streaming (body-sink) routes
+      // (0 = unlimited). Requests exceeding this are rejected with HTTP 413 before the
+      // sink is created. Must be configured before starting the server.
+      inline http_server& max_streamed_body_size(size_t max_size)
+      {
+         conn_config_.max_streamed_body_size = max_size;
+         return *this;
+      }
+
+      size_t max_streamed_body_size() const { return conn_config_.max_streamed_body_size; }
+
       /**
        * @brief Wait for a shutdown signal
        *
@@ -2360,6 +2420,9 @@ namespace glz
          bool should_close = false;
          response response_; // Persists across keep-alive requests to reuse capacity
          std::string header_buf; // Persists across keep-alive requests to reuse capacity
+         std::unique_ptr<body_sink> body_sink_; // Active streaming-body consumer
+         std::size_t body_remaining_ = 0; // Bytes of the streamed body still unread
+         std::string chunk_buf_; // Reused body read buffer (body_chunk_size bytes)
 
          connection_state(socket_type sock, asio::ip::tcp::endpoint endpoint)
             : socket(std::move(sock)),
@@ -2711,6 +2774,27 @@ namespace glz
             }
          }
 
+         // Parse path and query string from target. Done here rather than in
+         // process_full_request_with_conn because the body-route lookup below needs the
+         // path before a single body byte has been read.
+         const auto [path_view, query_string] = split_target(conn->request_.target);
+         conn->request_.path = std::string(path_view);
+         conn->request_.query = parse_urlencoded(query_string);
+
+         // Streaming-body routes take the body before it is buffered, so they are matched
+         // ahead of the buffered-body size cap and enforce max_streamed_body_size instead.
+         //
+         // Fast path: skip the match entirely when no body route is registered. The
+         // empty-check is O(1), while match_body() would allocate a params map and split
+         // the path on every request.
+         if (!root_router.body_routes.routes.empty()) {
+            auto [body_handle, body_params] = root_router.match_body(conn->request_.method, conn->request_.path);
+            if (body_handle) {
+               handle_body_request(conn, body_handle, std::move(body_params), content_length, result.headers_end);
+               return;
+            }
+         }
+
          // Reject oversized request bodies before allocating memory
          if (conn_config_.max_request_body_size > 0 && content_length > conn_config_.max_request_body_size) {
             send_error_response_with_close(conn, 413, "Payload Too Large");
@@ -2789,11 +2873,6 @@ namespace glz
             request.remote_ip = conn->remote_endpoint.address().to_string();
             request.remote_port = conn->remote_endpoint.port();
          }
-
-         // Parse path and query string from target
-         const auto [path_view, query_string] = split_target(conn->request_.target);
-         request.path = std::string(path_view);
-         request.query = parse_urlencoded(query_string);
 
          // Check for a streaming handler first. Streaming routes share the same
          // radix-tree matcher as normal routes, so they support ":param" paths.
@@ -3221,6 +3300,180 @@ namespace glz
          }
       }
 
+      // Dispatch a request whose body is consumed by a body_sink instead of being
+      // buffered into request.body. The sink is created from the request head, before any
+      // body byte is read, and then fed the body in body_chunk_size pieces.
+      inline void handle_body_request(std::shared_ptr<connection_state> conn, const body_handler& handler,
+                                      std::unordered_map<std::string, std::string> params,
+                                      std::size_t content_length, std::size_t body_offset)
+      {
+         request& req = conn->request_;
+         req.params = std::move(params);
+         req.body.clear();
+
+         // Lazy remote IP resolution (deferred from accept, as for buffered requests)
+         if (req.remote_ip.empty()) {
+            req.remote_ip = conn->remote_endpoint.address().to_string();
+            req.remote_port = conn->remote_endpoint.port();
+         }
+
+         // Body bytes already sitting in the read buffer belong to this request; only the
+         // rest still has to come off the socket.
+         const std::size_t buffered = (std::min)(content_length, conn->buf_len - body_offset);
+         conn->buf_consumed = body_offset + buffered;
+         conn->body_remaining_ = content_length - buffered;
+
+         conn->response_.clear();
+         conn->response_.status(200);
+
+         // Reject oversized streamed bodies before the sink is created
+         if (conn_config_.max_streamed_body_size > 0 && content_length > conn_config_.max_streamed_body_size) {
+            conn->response_.status(413).content_type("text/plain").body("Payload Too Large");
+            reject_body_request(conn);
+            return;
+         }
+
+         std::unique_ptr<body_sink> sink;
+         try {
+            sink = handler(req, conn->response_);
+         }
+         catch (const std::exception&) {
+            error_handler(std::make_error_code(std::errc::invalid_argument), std::source_location::current());
+            send_error_response_with_close(conn, 500, "Internal Server Error");
+            return;
+         }
+
+         if (!sink) {
+            // The handler declined the request and filled the response itself.
+            reject_body_request(conn);
+            return;
+         }
+
+         conn->body_sink_ = std::move(sink);
+
+         if (buffered > 0 && !feed_body_chunk(conn, std::string_view{&conn->read_buf[body_offset], buffered})) {
+            return;
+         }
+
+         read_body_chunk(conn);
+      }
+
+      // Hand one chunk to the active sink. Returns false when the sink refused it or
+      // threw; the rejection response is then already on its way.
+      //
+      // body_remaining_ counts bytes still to come off the socket, so the caller drops
+      // the chunk from that count before calling: a rejection here has to drain exactly
+      // what the peer has not sent yet.
+      inline bool feed_body_chunk(std::shared_ptr<connection_state> conn, std::string_view chunk)
+      {
+         bool accepted = false;
+         try {
+            accepted = conn->body_sink_->write(chunk, conn->response_);
+         }
+         catch (const std::exception&) {
+            error_handler(std::make_error_code(std::errc::invalid_argument), std::source_location::current());
+            conn->response_.clear();
+            conn->response_.status(500).content_type("text/plain").body("Internal Server Error");
+         }
+
+         if (!accepted) {
+            reject_body_request(conn);
+            return false;
+         }
+
+         return true;
+      }
+
+      // Read the next body chunk, or complete the request once the declared
+      // Content-Length has been delivered.
+      inline void read_body_chunk(std::shared_ptr<connection_state> conn)
+      {
+         if (conn->body_remaining_ == 0) {
+            auto sink = std::move(conn->body_sink_);
+            try {
+               sink->finish(conn->response_);
+            }
+            catch (const std::exception&) {
+               error_handler(std::make_error_code(std::errc::invalid_argument), std::source_location::current());
+               send_error_response_with_close(conn, 500, "Internal Server Error");
+               return;
+            }
+            // buf_consumed already accounts for the bytes taken from read_buf, so the
+            // keep-alive reset in send_response_with_conn shifts any pipelined leftover.
+            send_response_with_conn(conn, conn->response_);
+            return;
+         }
+
+         if (conn->chunk_buf_.size() < body_chunk_size) {
+            conn->chunk_buf_.resize(body_chunk_size);
+         }
+         const std::size_t want = (std::min)(conn->body_remaining_, body_chunk_size);
+
+         conn->socket.async_read_some(
+            asio::buffer(conn->chunk_buf_.data(), want), [this, conn](asio::error_code ec, std::size_t bytes_read) {
+               if (ec) {
+                  // The body never completed: no response can be sent.
+                  if (conn->body_sink_) {
+                     conn->body_sink_->abort();
+                     conn->body_sink_.reset();
+                  }
+                  if (ec != asio::error::eof && ec != asio::error::operation_aborted) {
+                     error_handler(ec, std::source_location::current());
+                  }
+                  return;
+               }
+
+               conn->body_remaining_ -= (std::min)(conn->body_remaining_, bytes_read);
+               if (!feed_body_chunk(conn, std::string_view{conn->chunk_buf_.data(), bytes_read})) {
+                  return;
+               }
+
+               read_body_chunk(conn);
+            });
+      }
+
+      // Send the response already sitting in conn->response_ for a body route whose body
+      // was not consumed, and close.
+      //
+      // The response goes out first: a peer that declared a body it has not finished
+      // sending (or has not started sending) must not wait for the discard below before it
+      // can read the error. Reading and writing are independent directions, so the
+      // bounded discard runs concurrently with the response write.
+      inline void reject_body_request(std::shared_ptr<connection_state> conn)
+      {
+         conn->should_close = true;
+         if (conn->body_sink_) {
+            conn->body_sink_->abort();
+            conn->body_sink_.reset();
+         }
+
+         send_response_with_conn(conn, conn->response_);
+         discard_body_remainder(conn, (std::min)(conn->body_remaining_, body_linger_discard_limit));
+      }
+
+      // Read and drop up to `remaining` bytes of a body nobody will consume, so a peer
+      // that is still uploading can finish its send instead of hitting a connection reset
+      // before it has read the response.
+      inline void discard_body_remainder(std::shared_ptr<connection_state> conn, std::size_t remaining)
+      {
+         if (remaining == 0) {
+            return;
+         }
+
+         if (conn->chunk_buf_.size() < body_chunk_size) {
+            conn->chunk_buf_.resize(body_chunk_size);
+         }
+         const std::size_t want = (std::min)(remaining, body_chunk_size);
+
+         conn->socket.async_read_some(asio::buffer(conn->chunk_buf_.data(), want),
+                                      [this, conn, remaining](asio::error_code ec, std::size_t bytes_read) {
+                                         if (ec) {
+                                            return; // Peer gone; the response is already written.
+                                         }
+                                         discard_body_remainder(conn, remaining - bytes_read);
+                                      });
+      }
+
       inline std::string_view get_status_message(int status_code)
       {
          switch (status_code) {
@@ -3242,6 +3495,8 @@ namespace glz
             return "Method Not Allowed";
          case 409:
             return "Conflict";
+         case 413:
+            return "Payload Too Large";
          case 418:
             return "I'm a teapot";
          case 500:
@@ -3250,6 +3505,8 @@ namespace glz
             return "Not Implemented";
          case 503:
             return "Service Unavailable";
+         case 507:
+            return "Insufficient Storage";
          default:
             return "Unknown";
          }

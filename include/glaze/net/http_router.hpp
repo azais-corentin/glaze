@@ -225,6 +225,37 @@ namespace glz
    // (no keep-alive) and write chunked responses through streaming_response.
    using streaming_handler = std::function<void(request&, streaming_response&)>;
 
+   // Per-request consumer of a streamed request body, created from the request head
+   // before any body byte is read. The server calls write() for each chunk in arrival
+   // order, then finish() once the full Content-Length has been delivered.
+   struct body_sink
+   {
+      body_sink() = default;
+      virtual ~body_sink() = default;
+
+      body_sink(const body_sink&) = delete;
+      body_sink& operator=(const body_sink&) = delete;
+      body_sink(body_sink&&) = delete;
+      body_sink& operator=(body_sink&&) = delete;
+
+      // Return false to stop reading the body; the server then sends `res` (which the
+      // sink is expected to have filled with an error) and closes the connection.
+      virtual bool write(std::string_view chunk, response& res) = 0;
+
+      // Called after the final chunk. Fill `res` with the response to send.
+      virtual void finish(response& res) = 0;
+
+      // Called when the connection failed before the body was complete. No response
+      // can be sent; release resources and discard partial output here.
+      virtual void abort() = 0;
+   };
+
+   // Body-route handler. Receives the request head (method/path/params/headers, empty
+   // body) and returns the sink for the body. Returning nullptr rejects the request:
+   // the handler must fill the response itself, and the server sends it without
+   // reading the body.
+   using body_handler = std::function<std::unique_ptr<body_sink>(const request&, response&)>;
+
    // WebSocket handler value: a websocket_server instance is bound to a path. The HTTP
    // server detects the upgrade handshake (Upgrade: websocket) and dispatches to the
    // matching server entry.
@@ -1068,6 +1099,35 @@ namespace glz
       }
 
       /**
+       * @brief Register a streaming request-body route. The handler runs as soon as the
+       * request head has been parsed and returns the sink that consumes the body.
+       *
+       * Supports the same path-parameter syntax as normal routes (":param" and "*name").
+       */
+      basic_http_router& body(http_method method, std::string_view path, body_handler handle,
+                              const route_spec& spec = {})
+      {
+         body_routes.add(method, path, std::move(handle), spec);
+         return *this;
+      }
+
+      /**
+       * @brief Register a streaming request-body POST route.
+       */
+      basic_http_router& body_post(std::string_view path, body_handler handle, const route_spec& spec = {})
+      {
+         return body(http_method::POST, path, std::move(handle), spec);
+      }
+
+      /**
+       * @brief Register a streaming request-body PUT route.
+       */
+      basic_http_router& body_put(std::string_view path, body_handler handle, const route_spec& spec = {})
+      {
+         return body(http_method::PUT, path, std::move(handle), spec);
+      }
+
+      /**
        * @brief Register a WebSocket handler for a path.
        *
        * Supports the same path-parameter syntax as normal routes. The HTTP server
@@ -1117,6 +1177,15 @@ namespace glz
       }
 
       /**
+       * @brief Match a request against registered streaming request-body routes.
+       */
+      std::pair<body_handler, std::unordered_map<std::string, std::string>> match_body(
+         http_method method, std::string_view target) const
+      {
+         return body_routes.match(method, target);
+      }
+
+      /**
        * @brief Match a WebSocket upgrade request against registered WebSocket routes.
        *
        * WebSocket upgrades are HTTP GET requests by definition, so the lookup uses
@@ -1137,6 +1206,8 @@ namespace glz
          normal_routes.print_tree();
          std::cout << "[streaming routes]\n";
          streaming_routes.print_tree();
+         std::cout << "[body routes]\n";
+         body_routes.print_tree();
          std::cout << "[websocket routes]\n";
          websocket_routes.print_tree();
       }
@@ -1168,6 +1239,13 @@ namespace glz
        * @brief Storage for streaming routes.
        */
       route_table<streaming_handler> streaming_routes;
+
+      /**
+       * @brief Storage for streaming request-body routes.
+       *
+       * Excluded from the OpenAPI spec, like streaming and WebSocket routes.
+       */
+      route_table<body_handler> body_routes;
 
       /**
        * @brief Storage for WebSocket routes.
